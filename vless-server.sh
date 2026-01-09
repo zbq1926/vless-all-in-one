@@ -649,7 +649,7 @@ generate_xray_config() {
                     local warp_out=$(gen_xray_warp_outbound)
                     if [[ -n "$warp_out" ]]; then
                         local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
-                            '.tag = $tag | .settings.domainStrategy = $ds')
+                            '.tag = $tag | .domainStrategy = $ds')
                         outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
                     fi
                 fi
@@ -683,7 +683,7 @@ generate_xray_config() {
                     local warp_out_default=$(echo "$warp_out" | jq '.tag = "warp"')
                     # 只有 WireGuard 类型才需要 domainStrategy
                     if echo "$warp_out_default" | jq -e '.protocol == "wireguard"' >/dev/null 2>&1; then
-                        warp_out_default=$(echo "$warp_out_default" | jq '.settings.domainStrategy = "UseIPv4"')
+                        warp_out_default=$(echo "$warp_out_default" | jq '.domainStrategy = "UseIPv4"')
                     fi
                     outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_default" '. + [$out]')
                 fi
@@ -5403,13 +5403,13 @@ download_wgcf() {
     [[ -z "$wgcf_ver" || "$wgcf_ver" == "null" ]] && wgcf_ver="2.2.29"
     echo -e " v${wgcf_ver}"
     
-    # 扩展镜像源列表（按优先级排序）
+    # 镜像源列表（优先使用支持 IPv6 的镜像，IPv4 直连放后面备选）
     local wgcf_urls=(
-        "https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
-        "https://ghproxy.net/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://ghps.cc/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
         "https://gh.ddlc.top/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+        "https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
+        "https://ghproxy.net/https://github.com/ViRb3/wgcf/releases/download/v${wgcf_ver}/wgcf_${wgcf_ver}_linux_${wgcf_arch}"
     )
     
     # 确保目录存在并可写
@@ -5583,6 +5583,16 @@ parse_and_save_warp_config() {
     public_key=$(normalize_base64 "$public_key")
     local endpoint=$(grep "Endpoint" "$conf_file" | cut -d'=' -f2 | xargs)
     
+    # 自动检测：纯 IPv6 服务器使用 IPv6 端点
+    local has_ipv4=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
+    if [[ -z "$has_ipv4" ]]; then
+        # 无 IPv4，替换为 Cloudflare WARP IPv6 端点
+        local ep_port=$(echo "$endpoint" | grep -oE ':[0-9]+$' | tr -d ':')
+        [[ -z "$ep_port" ]] && ep_port="2408"
+        endpoint="[2606:4700:d0::a29f:c001]:${ep_port}"
+        echo -e "  ${Y}提示${NC}: 检测到纯 IPv6 服务器，已自动切换到 IPv6 端点"
+    fi
+    
     # 解析 Address 行，可能有多行或逗号分隔
     local addresses=$(grep "Address" "$conf_file" | cut -d'=' -f2 | tr -d ' ' | tr '\n' ',' | sed 's/,$//')
     
@@ -5658,16 +5668,29 @@ gen_xray_warp_outbound() {
     local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE")
     local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE")
     local endpoint=$(jq -r '.endpoint' "$WARP_CONF_FILE")
-    local ep_host=$(echo "$endpoint" | cut -d':' -f1)
-    local ep_port=$(echo "$endpoint" | cut -d':' -f2)
+    
+    # 正确解析 endpoint（支持 IPv6 格式 [host]:port）
+    local ep_host ep_port
+    if [[ "$endpoint" == \[*\]:* ]]; then
+        # IPv6 格式: [2606:4700:d0::a29f:c001]:2408
+        ep_host=$(echo "$endpoint" | sed 's/^\[\(.*\)\]:.*/\1/')
+        ep_port=$(echo "$endpoint" | sed 's/.*\]://')
+    else
+        # IPv4 格式: 162.159.192.1:2408
+        ep_host=$(echo "$endpoint" | cut -d':' -f1)
+        ep_port=$(echo "$endpoint" | cut -d':' -f2)
+    fi
+    
+    # IPv6 地址需要方括号
+    local ep_formatted="$ep_host"
+    [[ "$ep_host" == *:* ]] && ep_formatted="[$ep_host]"
     
     jq -n \
         --arg pk "$private_key" \
         --arg pub "$public_key" \
         --arg v4 "$address_v4" \
         --arg v6 "$address_v6" \
-        --arg host "$ep_host" \
-        --argjson port "$ep_port" \
+        --arg endpoint "${ep_formatted}:${ep_port}" \
     '{
         tag: "warp",
         protocol: "wireguard",
@@ -5677,7 +5700,7 @@ gen_xray_warp_outbound() {
             peers: [{
                 publicKey: $pub,
                 allowedIPs: ["0.0.0.0/0", "::/0"],
-                endpoint: "\($host):\($port)"
+                endpoint: $endpoint
             }],
             mtu: 1280
         }
@@ -6837,8 +6860,18 @@ gen_singbox_warp_outbound() {
     local address_v4=$(jq -r '.address_v4' "$WARP_CONF_FILE")
     local address_v6=$(jq -r '.address_v6' "$WARP_CONF_FILE")
     local endpoint=$(jq -r '.endpoint' "$WARP_CONF_FILE")
-    local ep_host=$(echo "$endpoint" | cut -d':' -f1)
-    local ep_port=$(echo "$endpoint" | cut -d':' -f2)
+    
+    # 正确解析 endpoint（支持 IPv6 格式 [host]:port）
+    local ep_host ep_port
+    if [[ "$endpoint" == \[*\]:* ]]; then
+        # IPv6 格式: [2606:4700:d0::a29f:c001]:2408
+        ep_host=$(echo "$endpoint" | sed 's/^\[\(.*\)\]:.*/\1/')
+        ep_port=$(echo "$endpoint" | sed 's/.*\]://')
+    else
+        # IPv4 格式: 162.159.192.1:2408
+        ep_host=$(echo "$endpoint" | cut -d':' -f1)
+        ep_port=$(echo "$endpoint" | cut -d':' -f2)
+    fi
     
     jq -n \
         --arg pk "$private_key" \
