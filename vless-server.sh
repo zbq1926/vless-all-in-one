@@ -4483,9 +4483,14 @@ gen_snell_server_config() {
     local psk="$1" port="$2" version="${3:-4}"
     mkdir -p "$CFG"
 
-    local listen_addr=$(_listen_addr)
+    local listen_addr="0.0.0.0"
     local ipv6_enabled="false"
-    [[ "$listen_addr" == "::" ]] && ipv6_enabled="true"
+    if [[ "$version" != "4" ]]; then
+        listen_addr=$(_listen_addr)
+        [[ "$listen_addr" == "::" ]] && ipv6_enabled="true"
+    else
+        _has_ipv6 && ipv6_enabled="true"
+    fi
 
     cat > "$CFG/snell.conf" << EOF
 [snell-server]
@@ -4641,11 +4646,14 @@ gen_snell_shadowtls_server_config() {
         [[ $snell_backend_port -gt 65535 ]] && snell_backend_port=$((port - 10000))
     fi
     
+    local ipv6_line=""
+    [[ "$version" != "4" ]] && ipv6_line="ipv6 = false"
+
     cat > "$CFG/$snell_conf" << EOF
 [snell-server]
 listen = 127.0.0.1:$snell_backend_port
 psk = $psk
-ipv6 = false
+$ipv6_line
 obfs = off
 EOF
     
