@@ -8789,9 +8789,11 @@ _display_sorted_latencies() {
     done
 }
 
-# 选择出口的交互函数 (带延迟检测)
+# 选择出口的交互函数
+# 参数: $1=提示文本, $2=是否检测延迟(check_latency/no_check, 默认 check_latency)
 _select_outbound() {
     local prompt="${1:-选择出口}"
+    local check_mode="${2:-check_latency}"
     local outbounds=()
     local display_names=()
     
@@ -8840,17 +8842,19 @@ _select_outbound() {
 
     # 检测延迟（跳过直连、WARP 和负载均衡组）
     local need_latency_check=false
-    for info in "${display_names[@]}"; do
-        if [[ "$info" != "DIRECT" && "$info" != "WARP" ]]; then
-            need_latency_check=true
-            break
-        fi
-    done
-    
+    if [[ "$check_mode" == "check_latency" ]]; then
+        for info in "${display_names[@]}"; do
+            if [[ "$info" != "DIRECT" && "$info" != "WARP" ]]; then
+                need_latency_check=true
+                break
+            fi
+        done
+    fi
+
     if [[ "$need_latency_check" == "true" ]]; then
         echo -e "  ${C}▸${NC} 检测 $((${#outbounds[@]}-1)) 个节点延迟中..." >&2
     fi
-    
+
     local latency_results=()
     local idx=0
     for i in "${!display_names[@]}"; do
@@ -8859,9 +8863,14 @@ _select_outbound() {
         if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" ]]; then
             latency_results+=("-|$info|-")
         else
-            local node_name=$(echo "$info" | cut -d$'\t' -f1)
-            local result=$(check_node_latency "$node_name" 2>/dev/null)
-            latency_results+=("$result")
+            if [[ "$check_mode" == "check_latency" ]]; then
+                local node_name=$(echo "$info" | cut -d$'\t' -f1)
+                local result=$(check_node_latency "$node_name" 2>/dev/null)
+                latency_results+=("$result")
+            else
+                # 不检测延迟,使用占位符
+                latency_results+=("-|$info|-")
+            fi
         fi
         ((idx++))
         if [[ "$need_latency_check" == "true" ]]; then
@@ -8871,7 +8880,9 @@ _select_outbound() {
     if [[ "$need_latency_check" == "true" ]]; then
         echo -e "\r  ${G}✓${NC} 延迟检测完成                " >&2
     fi
-    echo "" >&2
+    if [[ "$check_mode" != "check_latency" ]]; then
+        echo "" >&2
+    fi
     
     # 构建排序数据: latency_num|idx|latency_display|name|type|server|port
     local sort_data=()
@@ -9559,7 +9570,7 @@ _add_routing_rule() {
     # 选择出口
     echo ""
     echo -e "  ${Y}选择出口:${NC}"
-    local outbound=$(_select_outbound "选择出口")
+    local outbound=$(_select_outbound "选择出口" "no_check")
     [[ -z "$outbound" ]] && return
     
     # 选择出口 IP 版本（仅 direct 出口需要）
