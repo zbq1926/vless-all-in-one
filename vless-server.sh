@@ -5701,6 +5701,72 @@ generate_singbox_config() {
             fi
         fi
 
+        # 生成负载均衡器 (sing-box 使用 urltest/selector outbound)
+        local balancer_groups=$(db_get_balancer_groups)
+        if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
+            while IFS= read -r group_json; do
+                local group_name=$(echo "$group_json" | jq -r '.name')
+                local strategy=$(echo "$group_json" | jq -r '.strategy')
+
+                # 构建节点 outbound 数组
+                local node_outbounds="[]"
+                local balancer_ip_version="prefer_ipv4"
+                local tag_suffix=""
+                case "$balancer_ip_version" in
+                    ipv4_only) tag_suffix="-ipv4" ;;
+                    ipv6_only) tag_suffix="-ipv6" ;;
+                    prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
+                    prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
+                esac
+
+                while IFS= read -r node_name; do
+                    [[ -z "$node_name" ]] && continue
+                    local node_tag="chain-${node_name}${tag_suffix}"
+                    node_outbounds=$(echo "$node_outbounds" | jq --arg tag "$node_tag" '. + [$tag]')
+
+                    # 确保节点 outbound 存在
+                    if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                        local chain_out=$(gen_singbox_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
+                        [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                    fi
+                done < <(echo "$group_json" | jq -r '.nodes[]?')
+
+                # 根据策略生成不同类型的 sing-box outbound
+                local balancer_out=""
+                case "$strategy" in
+                    leastPing)
+                        # sing-box 使用 urltest 实现最低延迟选择
+                        balancer_out=$(jq -n \
+                            --arg tag "balancer-${group_name}" \
+                            --argjson outbounds "$node_outbounds" \
+                            '{
+                                type: "urltest",
+                                tag: $tag,
+                                outbounds: $outbounds,
+                                url: "https://www.gstatic.com/generate_204",
+                                interval: "5m",
+                                tolerance: 50
+                            }')
+                        ;;
+                    random|roundRobin|*)
+                        # sing-box 使用 selector 实现手动/随机选择
+                        balancer_out=$(jq -n \
+                            --arg tag "balancer-${group_name}" \
+                            --argjson outbounds "$node_outbounds" \
+                            '{
+                                type: "selector",
+                                tag: $tag,
+                                outbounds: $outbounds,
+                                default: ($outbounds[0] // "direct")
+                            }')
+                        ;;
+                esac
+
+                # 添加负载均衡器 outbound
+                [[ -n "$balancer_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$balancer_out" '. + [$out]')
+            done < <(echo "$balancer_groups" | jq -c '.[]')
+        fi
+
         routing_rules=$(gen_singbox_routing_rules)
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             if [[ "$warp_has_endpoint" == "true" ]]; then
